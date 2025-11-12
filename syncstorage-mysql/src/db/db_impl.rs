@@ -469,9 +469,69 @@ impl Db for MysqlDb {
         })
     }
 
+    /// Ensure a user_collection entry exists, creating if necessary.
+    /// This is needed because unlike Spanner, MySQL requires explicit entries
+    /// in the user_collections table before querying BSOs.
+    ///
+    /// This fixes the regression introduced in PR #1708 where proper error
+    /// propagation exposed missing user_collection entries that were previously
+    /// silently ignored.
+    async fn ensure_user_collection_exists(
+        &mut self,
+        user_id: UserIdentifier,
+        collection_id: i32,
+    ) -> DbResult<()> {
+        use diesel::prelude::*;
+        
+        let uid = user_id.legacy_id as i64;
+        
+        // Check if user_collection exists
+        let exists = user_collections::table
+            .select(user_collections::user_id)
+            .filter(user_collections::user_id.eq(uid))
+            .filter(user_collections::collection_id.eq(collection_id))
+            .first::<i64>(&mut self.conn)
+            .await
+            .optional()?
+            .is_some();
+        
+        if !exists {
+            // Create the user_collection entry
+            let timestamp = self.timestamp().as_i64();
+            let upsert = format!(
+                r#"
+                    INSERT INTO user_collections ({user_id}, {collection_id}, {modified}, {total_bytes}, {count})
+                    VALUES (?, ?, ?, ?, ?)
+                    ON DUPLICATE KEY UPDATE
+                       {user_id} = {user_id}
+                "#,
+                user_id = USER_ID,
+                collection_id = COLLECTION_ID,
+                modified = LAST_MODIFIED,
+                count = COUNT,
+                total_bytes = TOTAL_BYTES,
+            );
+            sql_query(upsert)
+                .bind::<BigInt, _>(uid)
+                .bind::<Integer, _>(collection_id)
+                .bind::<BigInt, _>(timestamp)
+                .bind::<BigInt, _>(0i64)
+                .bind::<Integer, _>(0i32)
+                .execute(&mut self.conn)
+                .await?;
+        }
+        
+        Ok(())
+    }
+
     async fn get_bso(&mut self, params: params::GetBso) -> DbResult<Option<results::GetBso>> {
         let user_id = params.user_id.legacy_id as i64;
         let collection_id = self.get_collection_id(&params.collection).await?;
+        
+        // Ensure user_collection entry exists before querying
+        // This fixes the issue where PR #1708 exposed missing user_collection entries
+        self.ensure_user_collection_exists(params.user_id.clone(), collection_id).await?;
+        
         Ok(bso::table
             .select((
                 bso::id,
